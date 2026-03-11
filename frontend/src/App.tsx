@@ -15,6 +15,8 @@ import {
   WindowToggleMaximise,
 } from '../wailsjs/runtime/runtime';
 import { Minus, Square, Copy, X } from 'lucide-react';
+import iconImg from './assets/images/icon.png';
+import logoImg from './assets/images/logo.png';
 
 type Environment = {
   hostname: string;
@@ -249,9 +251,7 @@ export default function App() {
             <div className={`installer-slide ${appPhase === 'home' ? 'slide-active' : 'slide-left'}`}>
               <div className="flex flex-col items-center text-center px-8 max-w-xl">
                 {/* Logo */}
-                <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-orange-500 to-rose-500 flex items-center justify-center text-white text-3xl font-black tracking-tighter shadow-lg shadow-orange-500/30 mb-8 animate-fade-in-up">
-                  OC
-                </div>
+                <img src={logoImg} alt="OpenClaw Logo" className="h-auto w-56 object-contain mb-8 animate-fade-in-up drop-shadow-xl" />
 
                 <h1 className="text-4xl font-black text-slate-900 tracking-tight leading-tight mb-4 animate-fade-in-up animate-delay-100">
                   准备安装{' '}
@@ -300,9 +300,7 @@ export default function App() {
             {/* ===== SLIDE 2: Installing (Phase cards) ===== */}
             <div className={`installer-slide ${appPhase === 'installing' || appPhase === 'uninstalling' ? 'slide-active' : appPhase === 'home' ? 'slide-right' : 'slide-left'}`}>
               <div className="flex flex-col items-center w-full max-w-lg px-8">
-                <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-orange-500 to-rose-500 flex items-center justify-center text-white text-xl font-black shadow-lg shadow-orange-500/20 mb-6 shimmer-active">
-                  OC
-                </div>
+                <img src={iconImg} alt="Installing" className="w-16 h-16 object-contain mb-6 shimmer-active drop-shadow-lg drop-shadow-orange-500/20 rounded-2xl" />
 
                 <h2 className="text-2xl font-bold text-slate-800 mb-2">
                   {currentAction === 'install' ? '正在安装 OpenClaw' : '正在卸载 OpenClaw'}
@@ -580,9 +578,7 @@ function WindowChrome({ isMaximised, onToggleMaximise }: WindowChromeProps) {
         className="flex items-center gap-2 flex-1 drag-zone h-full min-w-0"
         onDoubleClick={onToggleMaximise}
       >
-        <div className="w-7 h-7 text-[10px] rounded-lg bg-gradient-to-br from-orange-500 to-red-500 flex items-center justify-center text-white font-black tracking-tighter shrink-0 shadow-sm shadow-orange-500/20">
-          OC
-        </div>
+        <img src={iconImg} alt="Icon" className="w-7 h-7 object-contain shrink-0 drop-shadow-sm rounded-lg" />
         <div className="flex flex-col min-w-0">
           <span className="text-[13px] font-bold text-slate-800 truncate tracking-wide">
             虾师傅
