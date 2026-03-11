@@ -42,11 +42,46 @@ func (a *App) RunPostInstallActions() PostInstallActionResult {
 }
 
 func runElevatedGatewayInstall(openclawPath string) error {
-	scriptPath, err := writePostInstallScript(openclawPath)
+	scriptPath, err := writeBatchScript("openclaw-postinstall-*.cmd", []string{
+		"@echo off",
+		"setlocal",
+		fmt.Sprintf("call \"%s\" config set gateway.mode local >nul 2>&1", openclawPath),
+		"if errorlevel 1 exit /b %errorlevel%",
+		fmt.Sprintf("call \"%s\" gateway install --force", openclawPath),
+		"if errorlevel 1 exit /b %errorlevel%",
+		fmt.Sprintf("call \"%s\" gateway start", openclawPath),
+		"if errorlevel 1 exit /b %errorlevel%",
+		"exit /b 0",
+		"",
+	})
 	if err != nil {
 		return fmt.Errorf("create post-install helper: %w", err)
 	}
 	defer os.Remove(scriptPath)
+
+	return runElevatedBatchScript(scriptPath, 2*time.Minute, "post-install action timed out while waiting for OpenClaw to finish configuring system integration")
+}
+
+func removeOpenClawScheduledTask() error {
+	scriptPath, err := writeBatchScript("openclaw-task-cleanup-*.cmd", []string{
+		"@echo off",
+		"setlocal",
+		"schtasks /Query /TN \"OpenClaw Gateway\" >nul 2>&1",
+		"if errorlevel 1 exit /b 0",
+		"schtasks /Delete /TN \"OpenClaw Gateway\" /F",
+		"if errorlevel 1 exit /b %errorlevel%",
+		"exit /b 0",
+		"",
+	})
+	if err != nil {
+		return fmt.Errorf("create task cleanup helper: %w", err)
+	}
+	defer os.Remove(scriptPath)
+
+	return runElevatedBatchScript(scriptPath, time.Minute, "scheduled-task cleanup timed out")
+}
+
+func runElevatedBatchScript(scriptPath string, timeout time.Duration, timeoutMessage string) error {
 
 	shellPath := detectPowerShell()
 	if shellPath == "not-found" {
@@ -60,7 +95,7 @@ func runElevatedGatewayInstall(openclawPath string) error {
 	cmd := exec.CommandContext(ctx, shellPath, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", psScript)
 	output, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("post-install action timed out while waiting for OpenClaw to finish configuring system integration")
+		return fmt.Errorf("%s", timeoutMessage)
 	}
 	if err == nil {
 		return nil
@@ -74,26 +109,14 @@ func runElevatedGatewayInstall(openclawPath string) error {
 	return fmt.Errorf("%s", message)
 }
 
-func writePostInstallScript(openclawPath string) (string, error) {
-	file, err := os.CreateTemp("", "openclaw-postinstall-*.cmd")
+func writeBatchScript(pattern string, lines []string) (string, error) {
+	file, err := os.CreateTemp("", pattern)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
 
-	content := strings.Join([]string{
-		"@echo off",
-		"setlocal",
-		fmt.Sprintf("call \"%s\" config set gateway.mode local >nul 2>&1", openclawPath),
-		"if errorlevel 1 exit /b %errorlevel%",
-		fmt.Sprintf("call \"%s\" gateway install --force", openclawPath),
-		"if errorlevel 1 exit /b %errorlevel%",
-		fmt.Sprintf("call \"%s\" gateway start", openclawPath),
-		"if errorlevel 1 exit /b %errorlevel%",
-		"exit /b 0",
-		"",
-	}, "\r\n")
-
+	content := strings.Join(lines, "\r\n")
 	if _, err := file.WriteString(content); err != nil {
 		return "", err
 	}

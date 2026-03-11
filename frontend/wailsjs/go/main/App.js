@@ -14,6 +14,10 @@ export function RunNativeInstaller(arg1) {
   return window['go']['main']['App']['RunNativeInstaller'](arg1);
 }
 
+export function RunNativeUninstaller() {
+  return window['go']['main']['App']['RunNativeUninstaller']();
+}
+
 export function RunPostInstallActions() {
   return window['go']['main']['App']['RunPostInstallActions']();
 }

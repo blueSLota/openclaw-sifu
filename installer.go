@@ -166,6 +166,74 @@ func (a *App) RunNativeInstaller(cfg InstallerConfig) InstallerResult {
 	}
 }
 
+func (a *App) RunNativeUninstaller() InstallerResult {
+	emit := func(step, status, msg string) {
+		if a.ctx != nil {
+			wruntime.EventsEmit(a.ctx, "installer:step", InstallerStepUpdate{
+				Step:    step,
+				Status:  status,
+				Message: msg,
+			})
+		}
+	}
+
+	emit("init", "running", "OpenClaw Uninstaller")
+
+	openclawPath := findOpenClawCommand()
+	taskExists := hasOpenClawScheduledTask()
+	if openclawPath == "" && !taskExists {
+		emit("detect", "error", "OpenClaw command not found")
+		return InstallerResult{
+			Success: false,
+			Error:   "未检测到 OpenClaw 安装。",
+		}
+	}
+
+	if openclawPath != "" {
+		emit("detect", "ok", fmt.Sprintf("OpenClaw found: %s", openclawPath))
+		emit("uninstall", "running", "Removing OpenClaw service, state, and workspace...")
+
+		if err := streamCommand("openclaw", []string{"uninstall", "--all", "--yes", "--non-interactive"}, nil, emit, "uninstall"); err != nil {
+			emit("uninstall", "error", fmt.Sprintf("OpenClaw uninstall failed: %v", err))
+			return InstallerResult{
+				Success: false,
+				Error:   fmt.Sprintf("OpenClaw 卸载失败: %v", err),
+			}
+		}
+		emit("uninstall", "ok", "OpenClaw local data removed")
+	} else {
+		emit("detect", "warn", "OpenClaw CLI not found, cleaning residual scheduled task only")
+		emit("uninstall", "skip", "Skipped official uninstall because OpenClaw CLI is already missing")
+	}
+
+	if taskExists {
+		emit("gateway", "running", "Removing OpenClaw scheduled task...")
+		if err := removeOpenClawScheduledTask(); err != nil {
+			emit("gateway", "error", fmt.Sprintf("Scheduled task cleanup failed: %v", err))
+			return InstallerResult{
+				Success: false,
+				Error:   fmt.Sprintf("删除 OpenClaw 计划任务失败: %v", err),
+			}
+		}
+		emit("gateway", "ok", "OpenClaw scheduled task removed")
+	}
+
+	if err := removeInstalledOpenClawCLI(openclawPath, emit); err != nil {
+		emit("cli-remove", "warn", fmt.Sprintf("CLI cleanup incomplete: %v", err))
+	} else {
+		emit("cli-remove", "ok", "OpenClaw CLI removed")
+	}
+
+	refreshSystemPath()
+
+	msg := "OpenClaw uninstalled successfully!"
+	emit("done", "ok", msg)
+	return InstallerResult{
+		Success: true,
+		Message: msg,
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Defaults from environment
 // ---------------------------------------------------------------------------
@@ -398,6 +466,35 @@ func buildNpmEnv(cfg InstallerConfig) []string {
 	return env
 }
 
+func removeInstalledOpenClawCLI(openclawPath string, emit func(string, string, string)) error {
+	removedAny := false
+
+	if checkCommandExists("npm") {
+		emit("cli-remove", "running", "Removing global OpenClaw CLI package...")
+		if err := streamCommand("npm", []string{"uninstall", "-g", "openclaw"}, buildNpmEnv(InstallerConfig{}), emit, "cli-remove"); err == nil {
+			removedAny = true
+		} else {
+			return fmt.Errorf("npm uninstall failed: %w", err)
+		}
+	}
+
+	userHome, _ := os.UserHomeDir()
+	wrapperDir := filepath.Join(userHome, ".local", "bin")
+	if strings.HasPrefix(strings.ToLower(openclawPath), strings.ToLower(wrapperDir)) {
+		if err := os.Remove(openclawPath); err == nil || os.IsNotExist(err) {
+			removedAny = true
+		} else {
+			return fmt.Errorf("remove wrapper %s: %w", openclawPath, err)
+		}
+	}
+
+	if !removedAny && emit != nil {
+		emit("cli-remove", "skip", "No removable CLI package detected")
+	}
+
+	return nil
+}
+
 // ---------------------------------------------------------------------------
 // Step: Install OpenClaw from Git
 // ---------------------------------------------------------------------------
@@ -598,6 +695,11 @@ func refreshSystemPath() {
 func checkCommandExists(name string) bool {
 	_, err := exec.LookPath(name)
 	return err == nil
+}
+
+func hasOpenClawScheduledTask() bool {
+	cmd := exec.Command("schtasks", "/Query", "/TN", "OpenClaw Gateway")
+	return cmd.Run() == nil
 }
 
 // execOutput runs a command and returns its combined stdout as a string.

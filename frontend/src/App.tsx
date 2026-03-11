@@ -4,6 +4,7 @@ import {
   GetBootstrapPayload,
   LaunchOpenClaw,
   RunNativeInstaller,
+  RunNativeUninstaller,
   RunPostInstallActions,
 } from '../wailsjs/go/main/App';
 import {
@@ -43,7 +44,8 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [isMaximised, setIsMaximised] = useState(false);
-  const [appPhase, setAppPhase] = useState<'home' | 'installing' | 'failed' | 'success'>('home');
+  const [appPhase, setAppPhase] = useState<'home' | 'installing' | 'uninstalling' | 'failed' | 'success'>('home');
+  const [currentAction, setCurrentAction] = useState<'install' | 'uninstall'>('install');
   const [installerSteps, setInstallerSteps] = useState<InstallerStepUpdate[]>([]);
   const [enableSystemIntegration, setEnableSystemIntegration] = useState(true);
   const [postInstallBusy, setPostInstallBusy] = useState(false);
@@ -100,6 +102,7 @@ export default function App() {
       return;
     }
 
+    setCurrentAction('install');
     setAppPhase('installing');
     setError('');
     setInstallerSteps([]);
@@ -128,6 +131,32 @@ export default function App() {
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : '启动安装程序失败。');
+      setAppPhase('failed');
+    }
+  }
+
+  async function startLocalUninstall() {
+    if (!payload) {
+      setError('无法获取当前环境信息。');
+      return;
+    }
+
+    setCurrentAction('uninstall');
+    setAppPhase('uninstalling');
+    setError('');
+    setInstallerSteps([]);
+    setPostInstallMessage(null);
+
+    try {
+      const result = await RunNativeUninstaller();
+      if (result.success) {
+        setAppPhase('success');
+      } else {
+        setError(result.error || '卸载失败');
+        setAppPhase('failed');
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '启动卸载程序失败。');
       setAppPhase('failed');
     }
   }
@@ -247,39 +276,59 @@ export default function App() {
                 </div>
 
                 {/* CTA */}
-                <button
-                  className="px-10 py-4 rounded-2xl font-bold text-lg text-white bg-gradient-to-r from-orange-500 to-orange-600 hover:from-orange-600 hover:to-orange-700 shadow-xl shadow-orange-500/25 transition-all hover:-translate-y-1 hover:shadow-2xl hover:shadow-orange-500/30 active:translate-y-0 animate-fade-in-up animate-delay-400"
-                  onClick={() => void startLocalInstall()}
-                >
-                  开始一键安装
-                </button>
+                <div className="flex flex-col sm:flex-row gap-3 animate-fade-in-up animate-delay-400">
+                  <button
+                    className="px-10 py-4 rounded-2xl font-bold text-lg text-white bg-gradient-to-r from-orange-500 to-orange-600 hover:from-orange-600 hover:to-orange-700 shadow-xl shadow-orange-500/25 transition-all hover:-translate-y-1 hover:shadow-2xl hover:shadow-orange-500/30 active:translate-y-0"
+                    onClick={() => void startLocalInstall()}
+                  >
+                    开始一键安装
+                  </button>
+                  <button
+                    className="px-10 py-4 rounded-2xl font-bold text-lg text-rose-700 bg-white border border-rose-200 hover:bg-rose-50 shadow-xl shadow-rose-100/40 transition-all hover:-translate-y-1 active:translate-y-0"
+                    onClick={() => void startLocalUninstall()}
+                  >
+                    一键卸载
+                  </button>
+                </div>
 
                 <p className="text-xs text-slate-400 mt-4 animate-fade-in-up animate-delay-500">
-                  安装过程完全自动，通常需要 1-3 分钟
+                  安装或卸载过程完全自动，通常需要 1-3 分钟
                 </p>
               </div>
             </div>
 
             {/* ===== SLIDE 2: Installing (Phase cards) ===== */}
-            <div className={`installer-slide ${appPhase === 'installing' ? 'slide-active' : appPhase === 'home' ? 'slide-right' : 'slide-left'}`}>
+            <div className={`installer-slide ${appPhase === 'installing' || appPhase === 'uninstalling' ? 'slide-active' : appPhase === 'home' ? 'slide-right' : 'slide-left'}`}>
               <div className="flex flex-col items-center w-full max-w-lg px-8">
                 <div className="w-16 h-16 rounded-2xl bg-gradient-to-br from-orange-500 to-rose-500 flex items-center justify-center text-white text-xl font-black shadow-lg shadow-orange-500/20 mb-6 shimmer-active">
                   OC
                 </div>
 
-                <h2 className="text-2xl font-bold text-slate-800 mb-2">正在安装 OpenClaw</h2>
-                <p className="text-sm text-slate-500 mb-8">请稍候，安装程序正在配置您的环境</p>
+                <h2 className="text-2xl font-bold text-slate-800 mb-2">
+                  {currentAction === 'install' ? '正在安装 OpenClaw' : '正在卸载 OpenClaw'}
+                </h2>
+                <p className="text-sm text-slate-500 mb-8">
+                  {currentAction === 'install' ? '请稍候，安装程序正在配置您的环境' : '请稍候，卸载程序正在清理您的环境'}
+                </p>
 
                 {/* Phase cards */}
                 <div className="w-full space-y-3">
                   {(() => {
-                    const phases = [
-                      { id: 'node', label: '检测运行环境', icon: '⬡', desc: '检查 Node.js 版本' },
-                      { id: 'npm-install', label: '安装核心组件', icon: '⚙', desc: '通过 npm 安装 OpenClaw' },
-                      { id: 'path', label: '配置系统路径', icon: '⛓', desc: '确保命令行可用' },
-                      { id: 'gateway', label: '初始化服务', icon: '◈', desc: '配置后台服务' },
-                      { id: 'done', label: '完成安装', icon: '✦', desc: '验证安装结果' },
-                    ];
+                    const phases = currentAction === 'install'
+                      ? [
+                        { id: 'node', label: '检测运行环境', icon: '⬡', desc: '检查 Node.js 版本' },
+                        { id: 'npm-install', label: '安装核心组件', icon: '⚙', desc: '通过 npm 安装 OpenClaw' },
+                        { id: 'path', label: '配置系统路径', icon: '⛓', desc: '确保命令行可用' },
+                        { id: 'gateway', label: '初始化服务', icon: '◈', desc: '配置后台服务' },
+                        { id: 'done', label: '完成安装', icon: '✦', desc: '验证安装结果' },
+                      ]
+                      : [
+                        { id: 'detect', label: '检查安装状态', icon: '⬡', desc: '确认 OpenClaw 已安装' },
+                        { id: 'uninstall', label: '移除服务与数据', icon: '⌦', desc: '执行官方卸载流程' },
+                        { id: 'gateway', label: '移除计划任务', icon: '◈', desc: '清理 OpenClaw Gateway 任务' },
+                        { id: 'cli-remove', label: '清理 CLI', icon: '⌫', desc: '移除全局 OpenClaw 命令' },
+                        { id: 'done', label: '完成卸载', icon: '✦', desc: '验证卸载结果' },
+                      ];
 
                     const currentStep = installerSteps.length > 0 ? installerSteps[installerSteps.length - 1] : null;
 
@@ -289,13 +338,22 @@ export default function App() {
                       ? (() => {
                         const stepId = currentStep.step;
                         // Map sub-steps to their parent phase
-                        const mapping: Record<string, string> = {
-                          'init': 'node', 'node': 'node', 'node-install': 'node',
-                          'detect': 'npm-install', 'npm-install': 'npm-install', 'git-install': 'npm-install', 'git-check': 'npm-install',
-                          'path': 'path',
-                          'gateway': 'gateway', 'doctor': 'gateway', 'onboard': 'gateway', 'setup': 'gateway',
-                          'done': 'done',
-                        };
+                        const mapping: Record<string, string> = currentAction === 'install'
+                          ? {
+                            'init': 'node', 'node': 'node', 'node-install': 'node',
+                            'detect': 'npm-install', 'npm-install': 'npm-install', 'git-install': 'npm-install', 'git-check': 'npm-install',
+                            'path': 'path',
+                            'gateway': 'gateway', 'doctor': 'gateway', 'onboard': 'gateway', 'setup': 'gateway',
+                            'done': 'done',
+                          }
+                          : {
+                            'init': 'detect',
+                            'detect': 'detect',
+                            'uninstall': 'uninstall',
+                            'gateway': 'gateway',
+                            'cli-remove': 'cli-remove',
+                            'done': 'done',
+                          };
                         const mapped = mapping[stepId] || stepId;
                         const idx = phaseOrder.indexOf(mapped);
                         return idx >= 0 ? idx : 0;
@@ -364,7 +422,7 @@ export default function App() {
                 </div>
 
                 <h2 className="text-3xl font-black text-slate-900 mb-3 animate-fade-in-up">
-                  安装完成！
+                  {currentAction === 'install' ? '安装完成！' : '卸载完成！'}
                 </h2>
 
                 {installerSteps.find(s => s.step === 'done' && s.status === 'ok') && (
@@ -374,11 +432,20 @@ export default function App() {
                 )}
 
                 <p className="text-slate-500 text-base leading-relaxed font-medium mb-10 animate-fade-in-up animate-delay-200">
-                  OpenClaw 已成功安装到您的电脑中。<br />
-                  现在打开 OpenClaw 开始使用吧！
+                  {currentAction === 'install' ? (
+                    <>
+                      OpenClaw 已成功安装到您的电脑中。<br />
+                      现在打开 OpenClaw 开始使用吧！
+                    </>
+                  ) : (
+                    <>
+                      OpenClaw 已从这台电脑中移除。<br />
+                      如需重新使用，可返回首页再次安装。
+                    </>
+                  )}
                 </p>
 
-                {supportsPostInstallElevation && (
+                {currentAction === 'install' && supportsPostInstallElevation && (
                   <label className="w-full text-left bg-slate-50 border border-slate-200 rounded-2xl p-4 mb-6 animate-fade-in-up animate-delay-300 cursor-pointer">
                     <div className="flex items-start gap-3">
                       <input
@@ -403,7 +470,7 @@ export default function App() {
                   </label>
                 )}
 
-                {postInstallMessage && (
+                {currentAction === 'install' && postInstallMessage && (
                   <div className={`w-full rounded-2xl p-4 mb-6 text-left animate-fade-in-up ${postInstallMessage.tone === 'error'
                     ? 'bg-rose-50 border border-rose-200 text-rose-700'
                     : 'bg-amber-50 border border-amber-200 text-amber-700'
@@ -415,19 +482,33 @@ export default function App() {
                   </div>
                 )}
 
-                <button
-                  className="px-10 py-4 rounded-2xl font-bold text-lg text-white bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 shadow-xl shadow-emerald-500/25 transition-all hover:-translate-y-1 hover:shadow-2xl hover:shadow-emerald-500/30 active:translate-y-0 animate-fade-in-up animate-delay-400 disabled:opacity-70 disabled:hover:translate-y-0"
-                  onClick={() => void finishInstall()}
-                  disabled={postInstallBusy}
-                >
-                  {postInstallBusy
-                    ? supportsPostInstallElevation && enableSystemIntegration
-                      ? '正在请求管理员授权...'
-                      : '正在打开 OpenClaw...'
-                    : supportsPostInstallElevation && enableSystemIntegration
-                      ? '授权并打开 OpenClaw'
-                      : '打开 OpenClaw'}
-                </button>
+                {currentAction === 'install' ? (
+                  <button
+                    className="px-10 py-4 rounded-2xl font-bold text-lg text-white bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 shadow-xl shadow-emerald-500/25 transition-all hover:-translate-y-1 hover:shadow-2xl hover:shadow-emerald-500/30 active:translate-y-0 animate-fade-in-up animate-delay-400 disabled:opacity-70 disabled:hover:translate-y-0"
+                    onClick={() => void finishInstall()}
+                    disabled={postInstallBusy}
+                  >
+                    {postInstallBusy
+                      ? supportsPostInstallElevation && enableSystemIntegration
+                        ? '正在请求管理员授权...'
+                        : '正在打开 OpenClaw...'
+                      : supportsPostInstallElevation && enableSystemIntegration
+                        ? '授权并打开 OpenClaw'
+                        : '打开 OpenClaw'}
+                  </button>
+                ) : (
+                  <button
+                    className="px-10 py-4 rounded-2xl font-bold text-lg text-white bg-gradient-to-r from-slate-700 to-slate-800 hover:from-slate-800 hover:to-slate-900 shadow-xl shadow-slate-400/20 transition-all hover:-translate-y-1 active:translate-y-0 animate-fade-in-up animate-delay-400"
+                    onClick={() => {
+                      setAppPhase('home');
+                      setCurrentAction('install');
+                      setError('');
+                      setInstallerSteps([]);
+                    }}
+                  >
+                    返回首页
+                  </button>
+                )}
 
                 <button
                   className="mt-4 text-sm text-slate-400 hover:text-slate-600 transition-colors animate-fade-in-up animate-delay-500"
@@ -447,11 +528,11 @@ export default function App() {
                 </div>
 
                 <h2 className="text-3xl font-black text-slate-900 mb-3 animate-fade-in-up">
-                  安装遇到问题
+                  {currentAction === 'install' ? '安装遇到问题' : '卸载遇到问题'}
                 </h2>
 
                 <p className="text-slate-500 text-base leading-relaxed font-medium mb-6 animate-fade-in-up animate-delay-100">
-                  安装过程中遇到了一些障碍，您可以重试安装。
+                  {currentAction === 'install' ? '安装过程中遇到了一些障碍，您可以重试安装。' : '卸载过程中遇到了一些障碍，您可以返回首页后重试卸载。'}
                 </p>
 
                 {/* Error detail */}
@@ -469,11 +550,12 @@ export default function App() {
                     className="px-8 py-3.5 rounded-2xl font-bold text-white bg-gradient-to-r from-orange-500 to-orange-600 hover:from-orange-600 hover:to-orange-700 shadow-lg shadow-orange-500/20 transition-all hover:-translate-y-0.5"
                     onClick={() => {
                       setAppPhase('home');
+                      setCurrentAction('install');
                       setError('');
                       setInstallerSteps([]);
                     }}
                   >
-                    返回重试
+                    返回首页
                   </button>
                 </div>
               </div>

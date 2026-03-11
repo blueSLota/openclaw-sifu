@@ -8,4 +8,6 @@ export function LaunchOpenClaw():Promise<void>;
 
 export function RunNativeInstaller(arg1:main.InstallerConfig):Promise<main.InstallerResult>;
 
+export function RunNativeUninstaller():Promise<main.InstallerResult>;
+
 export function RunPostInstallActions():Promise<main.PostInstallActionResult>;
