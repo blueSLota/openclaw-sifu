@@ -1,5 +1,9 @@
 # OpenClaw-Sifu
 
+<p align="center">
+  <img src="frontend/src/assets/images/logo.png" alt="OpenClaw-Sifu Logo" width="300" />
+</p>
+
 [English](#english) | [中文](#中文)
 
 <a name="english"></a>
