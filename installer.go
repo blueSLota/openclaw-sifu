@@ -3,11 +3,17 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -80,12 +86,12 @@ func (a *App) RunNativeInstaller(cfg InstallerConfig) InstallerResult {
 	// Step 1: Check / install Node.js ---------------------------------------
 	nodeVer, nodeOk := checkNodeJS(emit)
 	if !nodeOk {
-		installed := installNodeJS(emit)
+		installed := installNodeJS(cfg, emit)
 		if !installed {
 			emit("node", "error", "Node.js 22+ is required but could not be installed automatically")
 			return InstallerResult{
 				Success: false,
-				Error:   "Node.js 22+ is required. Please install it manually from https://nodejs.org/",
+				Error:   fmt.Sprintf("Node.js %s+ is required. Please install it manually from %s.", formatSemverParts(minimumNodeVersion), nodeMirrorDownloadURL()),
 			}
 		}
 		refreshSystemPath()
@@ -110,19 +116,19 @@ func (a *App) RunNativeInstaller(cfg InstallerConfig) InstallerResult {
 	// Step 3: Install OpenClaw ----------------------------------------------
 	switch cfg.InstallMethod {
 	case "git":
-		if !checkCommandExists("git") {
-			emit("git", "error", "Git is required for git install method")
+		if err := ensureGitAvailable(cfg, emit); err != nil {
+			emit("git-check", "error", err.Error())
 			return InstallerResult{
 				Success: false,
-				Error:   "Git is required. Install from https://git-scm.com/download/win",
+				Error:   err.Error(),
 			}
 		}
 		if err := installOpenClawGit(cfg, emit); err != nil {
 			return InstallerResult{Success: false, Error: err.Error()}
 		}
 	default:
-		if !checkCommandExists("git") {
-			emit("git-check", "warn", "Git not found — npm install may fail for packages with git dependencies")
+		if err := ensureGitAvailable(cfg, emit); err != nil {
+			return InstallerResult{Success: false, Error: err.Error()}
 		}
 		if err := installOpenClawNpm(cfg, emit); err != nil {
 			return InstallerResult{Success: false, Error: err.Error()}
@@ -266,6 +272,8 @@ func applyInstallerDefaults(cfg InstallerConfig) InstallerConfig {
 	if cfg.UseCnMirrors || useCn {
 		cfg.UseCnMirrors = true
 	}
+	// Keep all installer download paths on domestic mirrors.
+	cfg.UseCnMirrors = true
 
 	if cfg.NpmRegistry == "" {
 		cfg.NpmRegistry = os.Getenv("OPENCLAW_NPM_REGISTRY")
@@ -289,6 +297,9 @@ func applyInstallerDefaults(cfg InstallerConfig) InstallerConfig {
 	if cfg.RepoUrl == "" {
 		cfg.RepoUrl = envOrDefault("OPENCLAW_GIT_REPO_URL", "https://github.com/openclaw/openclaw.git")
 	}
+	if cfg.UseCnMirrors {
+		cfg.RepoUrl = rewriteGitHubURLToMirror(cfg.RepoUrl)
+	}
 
 	return cfg
 }
@@ -304,7 +315,15 @@ func envOrDefault(key, fallback string) string {
 // Step: Node.js
 // ---------------------------------------------------------------------------
 
-var nodeVersionRe = regexp.MustCompile(`v(\d+)\.`)
+var nodeVersionRe = regexp.MustCompile(`v?(\d+)\.(\d+)\.(\d+)`)
+
+type semverParts struct {
+	Major int
+	Minor int
+	Patch int
+}
+
+var minimumNodeVersion = semverParts{Major: 22, Minor: 12, Patch: 0}
 
 func checkNodeJS(emit func(string, string, string)) (string, bool) {
 	emit("node", "running", "Checking Node.js...")
@@ -316,15 +335,14 @@ func checkNodeJS(emit func(string, string, string)) (string, bool) {
 	}
 
 	ver := strings.TrimSpace(out)
-	matches := nodeVersionRe.FindStringSubmatch(ver)
-	if len(matches) < 2 {
+	parsed, ok := parseSemverParts(ver)
+	if !ok {
 		emit("node", "warn", fmt.Sprintf("Could not parse Node.js version: %s", ver))
 		return ver, false
 	}
 
-	major, _ := strconv.Atoi(matches[1])
-	if major < 22 {
-		emit("node", "warn", fmt.Sprintf("Node.js %s found but v22+ required", ver))
+	if compareSemverParts(parsed, minimumNodeVersion) < 0 {
+		emit("node", "warn", fmt.Sprintf("Node.js %s found but v%s+ required", ver, formatSemverParts(minimumNodeVersion)))
 		return ver, false
 	}
 
@@ -332,8 +350,20 @@ func checkNodeJS(emit func(string, string, string)) (string, bool) {
 	return ver, true
 }
 
-func installNodeJS(emit func(string, string, string)) bool {
+func installNodeJS(cfg InstallerConfig, emit func(string, string, string)) bool {
 	emit("node-install", "running", "Installing Node.js...")
+
+	if cfg.UseCnMirrors && runtime.GOOS == "windows" {
+		emit("node-install", "running", "Installing Node.js from domestic mirror...")
+		if err := installNodeFromMirror(emit); err == nil {
+			emit("node-install", "ok", "Node.js installed from domestic mirror")
+			return true
+		} else {
+			emit("node-install", "warn", fmt.Sprintf("mirror install failed: %v", err))
+			emit("node-install", "error", fmt.Sprintf("Mirror install failed. Please use the mirror download page instead: %s", nodeMirrorDownloadURL()))
+			return false
+		}
+	}
 
 	// Try winget
 	if checkCommandExists("winget") {
@@ -371,8 +401,351 @@ func installNodeJS(emit func(string, string, string)) bool {
 		emit("node-install", "warn", fmt.Sprintf("Scoop install failed: %v", err))
 	}
 
-	emit("node-install", "error", "No package manager found (winget, choco, scoop)")
+	emit("node-install", "error", fmt.Sprintf("No package manager found (winget, choco, scoop). Use the mirror download page instead: %s", nodeMirrorDownloadURL()))
 	return false
+}
+
+type nodeMirrorVersion struct {
+	Version string   `json:"version"`
+	Files   []string `json:"files"`
+}
+
+func installNodeFromMirror(emit func(string, string, string)) error {
+	version, assetName, err := latestNodeMirrorInstaller()
+	if err != nil {
+		return err
+	}
+
+	assetURL := fmt.Sprintf("%s%s/%s", nodeMirrorBinaryAPI(), version, assetName)
+	emit("node-install", "running", fmt.Sprintf("Downloading Node.js installer from mirror: %s", assetName))
+	installerPath, err := downloadMirrorAsset(assetURL, assetName)
+	if err != nil {
+		return fmt.Errorf("download node mirror asset: %w", err)
+	}
+	defer os.Remove(installerPath)
+
+	emit("node-install", "running", "Running Node.js mirror installer...")
+	if strings.HasSuffix(strings.ToLower(assetName), ".msi") {
+		return streamCommand("msiexec.exe", []string{"/i", installerPath, "/qn", "/norestart"}, nil, emit, "node-install")
+	}
+
+	return streamCommand(installerPath, []string{"/quiet"}, nil, emit, "node-install")
+}
+
+func latestNodeMirrorInstaller() (string, string, error) {
+	items, err := fetchNodeMirrorVersions()
+	if err != nil {
+		return "", "", err
+	}
+
+	assetMarker, assetName := nodeMirrorAssetSpec()
+	candidates := make([]nodeMirrorVersion, 0, len(items))
+	for _, item := range items {
+		parsed, ok := parseSemverParts(item.Version)
+		if !ok || parsed.Major != 22 || compareSemverParts(parsed, minimumNodeVersion) < 0 {
+			continue
+		}
+		if containsString(item.Files, assetMarker) {
+			candidates = append(candidates, item)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return "", "", fmt.Errorf("no Node.js mirror installer found for %s and Node %s+", runtime.GOARCH, formatSemverParts(minimumNodeVersion))
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		left, _ := parseSemverParts(candidates[i].Version)
+		right, _ := parseSemverParts(candidates[j].Version)
+		return compareSemverParts(left, right) > 0
+	})
+
+	return candidates[0].Version, fmt.Sprintf("node-%s-%s", candidates[0].Version, assetName), nil
+}
+
+func fetchNodeMirrorVersions() ([]nodeMirrorVersion, error) {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(nodeMirrorIndexAPI())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected status %s", resp.Status)
+	}
+
+	var items []nodeMirrorVersion
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func nodeMirrorAssetSpec() (string, string) {
+	switch runtime.GOARCH {
+	case "arm64":
+		return "win-arm64-msi", "arm64.msi"
+	case "386":
+		return "win-x86-msi", "x86.msi"
+	default:
+		return "win-x64-msi", "x64.msi"
+	}
+}
+
+func ensureGitAvailable(cfg InstallerConfig, emit func(string, string, string)) error {
+	if checkCommandExists("git") {
+		emit("git-check", "ok", "Git found")
+		return nil
+	}
+
+	emit("git-check", "running", "Git not found. Installing Git...")
+	if !installGit(cfg, emit) {
+		return fmt.Errorf("Git is required by the current OpenClaw install flow. Please install it manually from %s and retry.", gitMirrorDownloadURL())
+	}
+
+	refreshSystemPath()
+	if checkCommandExists("git") {
+		emit("git-check", "ok", "Git installed")
+		return nil
+	}
+
+	return fmt.Errorf("Git was installed but is still not detected. Please restart this application and retry. If needed, install Git manually from %s.", gitMirrorDownloadURL())
+}
+
+func installGit(cfg InstallerConfig, emit func(string, string, string)) bool {
+	if cfg.UseCnMirrors && runtime.GOOS == "windows" {
+		emit("git-check", "running", "Installing Git from domestic mirror...")
+		if err := installGitFromMirror(emit); err == nil {
+			emit("git-check", "ok", "Git installed from domestic mirror")
+			return true
+		} else {
+			emit("git-check", "warn", fmt.Sprintf("mirror install failed: %v", err))
+			emit("git-check", "error", fmt.Sprintf("Mirror install failed. Please use the mirror download page instead: %s", gitMirrorDownloadURL()))
+			return false
+		}
+	}
+
+	if checkCommandExists("winget") {
+		emit("git-check", "running", "Installing Git via winget...")
+		err := streamCommand("winget", []string{
+			"install", "Git.Git",
+			"--accept-package-agreements", "--accept-source-agreements",
+		}, nil, emit, "git-check")
+		if err == nil {
+			emit("git-check", "ok", "Git installed via winget")
+			return true
+		}
+		emit("git-check", "warn", fmt.Sprintf("winget install failed: %v", err))
+	}
+
+	if checkCommandExists("choco") {
+		emit("git-check", "running", "Installing Git via Chocolatey...")
+		err := streamCommand("choco", []string{"install", "git", "-y"}, nil, emit, "git-check")
+		if err == nil {
+			emit("git-check", "ok", "Git installed via Chocolatey")
+			return true
+		}
+		emit("git-check", "warn", fmt.Sprintf("Chocolatey install failed: %v", err))
+	}
+
+	if checkCommandExists("scoop") {
+		emit("git-check", "running", "Installing Git via Scoop...")
+		err := streamCommand("scoop", []string{"install", "git"}, nil, emit, "git-check")
+		if err == nil {
+			emit("git-check", "ok", "Git installed via Scoop")
+			return true
+		}
+		emit("git-check", "warn", fmt.Sprintf("Scoop install failed: %v", err))
+	}
+
+	emit("git-check", "error", fmt.Sprintf("No package manager found to install Git automatically (winget, choco, scoop). Use the mirror download page instead: %s", gitMirrorDownloadURL()))
+	return false
+}
+
+type mirrorIndexItem struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	URL      string `json:"url"`
+	Modified string `json:"modified"`
+}
+
+type gitMirrorRelease struct {
+	item    mirrorIndexItem
+	version [4]int
+}
+
+var gitMirrorReleaseRe = regexp.MustCompile(`^v(\d+)\.(\d+)\.(\d+)\.windows\.(\d+)/$`)
+
+func installGitFromMirror(emit func(string, string, string)) error {
+	release, err := latestGitMirrorRelease()
+	if err != nil {
+		return err
+	}
+
+	asset, err := selectGitMirrorInstaller(release.item.URL)
+	if err != nil {
+		return err
+	}
+
+	emit("git-check", "running", fmt.Sprintf("Downloading Git installer from mirror: %s", asset.Name))
+	installerPath, err := downloadMirrorAsset(asset.URL, asset.Name)
+	if err != nil {
+		return fmt.Errorf("download mirror asset: %w", err)
+	}
+	defer os.Remove(installerPath)
+
+	emit("git-check", "running", "Running Git mirror installer...")
+	if err := streamCommand(installerPath, []string{"/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-"}, nil, emit, "git-check"); err != nil {
+		return fmt.Errorf("run mirror installer: %w", err)
+	}
+
+	return nil
+}
+
+func latestGitMirrorRelease() (gitMirrorRelease, error) {
+	items, err := fetchMirrorIndex(gitMirrorBinaryAPI())
+	if err != nil {
+		return gitMirrorRelease{}, fmt.Errorf("fetch git mirror index: %w", err)
+	}
+
+	releases := make([]gitMirrorRelease, 0, len(items))
+	for _, item := range items {
+		if item.Type != "dir" {
+			continue
+		}
+
+		matches := gitMirrorReleaseRe.FindStringSubmatch(item.Name)
+		if len(matches) != 5 {
+			continue
+		}
+
+		version := [4]int{}
+		valid := true
+		for i := 1; i < len(matches); i++ {
+			value, convErr := strconv.Atoi(matches[i])
+			if convErr != nil {
+				valid = false
+				break
+			}
+			version[i-1] = value
+		}
+		if !valid {
+			continue
+		}
+
+		releases = append(releases, gitMirrorRelease{item: item, version: version})
+	}
+
+	if len(releases) == 0 {
+		return gitMirrorRelease{}, fmt.Errorf("no stable Git for Windows releases found on mirror")
+	}
+
+	sort.Slice(releases, func(i, j int) bool {
+		for idx := 0; idx < len(releases[i].version); idx++ {
+			if releases[i].version[idx] != releases[j].version[idx] {
+				return releases[i].version[idx] > releases[j].version[idx]
+			}
+		}
+		return releases[i].item.Name > releases[j].item.Name
+	})
+
+	return releases[0], nil
+}
+
+func selectGitMirrorInstaller(releaseURL string) (mirrorIndexItem, error) {
+	items, err := fetchMirrorIndex(releaseURL)
+	if err != nil {
+		return mirrorIndexItem{}, fmt.Errorf("fetch git release assets: %w", err)
+	}
+
+	suffixes := []string{}
+	switch runtime.GOARCH {
+	case "amd64":
+		suffixes = []string{"-64-bit.exe"}
+	case "arm64":
+		suffixes = []string{"-arm64.exe"}
+	case "386":
+		suffixes = []string{"-32-bit.exe"}
+	default:
+		suffixes = []string{"-64-bit.exe", "-arm64.exe"}
+	}
+
+	for _, suffix := range suffixes {
+		for _, item := range items {
+			if item.Type == "file" && strings.HasPrefix(item.Name, "Git-") && strings.HasSuffix(item.Name, suffix) {
+				return item, nil
+			}
+		}
+	}
+
+	return mirrorIndexItem{}, fmt.Errorf("no Git installer found for %s on mirror", runtime.GOARCH)
+}
+
+func fetchMirrorIndex(url string) ([]mirrorIndexItem, error) {
+	client := &http.Client{Timeout: 2 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("unexpected status %s", resp.Status)
+	}
+
+	var items []mirrorIndexItem
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func downloadMirrorAsset(url, fileName string) (string, error) {
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("unexpected status %s", resp.Status)
+	}
+
+	ext := filepath.Ext(fileName)
+	tempFile, err := os.CreateTemp("", "openclaw-mirror-*"+ext)
+	if err != nil {
+		return "", err
+	}
+	defer tempFile.Close()
+
+	if _, err := io.Copy(tempFile, resp.Body); err != nil {
+		os.Remove(tempFile.Name())
+		return "", err
+	}
+
+	return tempFile.Name(), nil
+}
+
+func gitMirrorBinaryAPI() string {
+	return "https://registry.npmmirror.com/-/binary/git-for-windows/"
+}
+
+func nodeMirrorBinaryAPI() string {
+	return "https://registry.npmmirror.com/-/binary/node/"
+}
+
+func nodeMirrorIndexAPI() string {
+	return "https://registry.npmmirror.com/-/binary/node/index.json"
+}
+
+func gitMirrorDownloadURL() string {
+	return "https://npmmirror.com/mirrors/git-for-windows/"
+}
+
+func nodeMirrorDownloadURL() string {
+	return "https://npmmirror.com/mirrors/node/"
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +808,9 @@ func installOpenClawNpm(cfg InstallerConfig, emit func(string, string, string)) 
 	emit("npm-install", "running", fmt.Sprintf("Installing %s@%s via npm...", packageName, cfg.Tag))
 
 	env := buildNpmEnv(cfg)
+	if runtime.GOOS == "windows" {
+		emit("npm-install", "warn", "Enabling Windows compatibility mode for native AI bindings during install")
+	}
 	args := []string{"install", "-g", fmt.Sprintf("%s@%s", packageName, cfg.Tag)}
 
 	err := streamCommand("npm", args, env, emit, "npm-install")
@@ -454,8 +830,26 @@ func buildNpmEnv(cfg InstallerConfig) []string {
 	env = setEnv(env, "NPM_CONFIG_UPDATE_NOTIFIER", "false")
 	env = setEnv(env, "NPM_CONFIG_FUND", "false")
 	env = setEnv(env, "NPM_CONFIG_AUDIT", "false")
-	// Avoid PowerShell lifecycle scripts — use cmd.exe instead
-	env = setEnv(env, "NPM_CONFIG_SCRIPT_SHELL", "cmd.exe")
+	// Avoid PowerShell lifecycle scripts. On Windows, prefer an absolute cmd.exe
+	// path so npm lifecycle hooks do not fail with ENOENT when PATH is incomplete.
+	if runtime.GOOS == "windows" {
+		if cmdShell := resolveWindowsCmdPath(); cmdShell != "" {
+			env = setEnv(env, "ComSpec", cmdShell)
+			env = setEnv(env, "NPM_CONFIG_SCRIPT_SHELL", cmdShell)
+		}
+		if systemRoot := os.Getenv("SystemRoot"); systemRoot != "" {
+			env = setEnv(env, "SystemRoot", systemRoot)
+		}
+	} else {
+		env = setEnv(env, "NPM_CONFIG_SCRIPT_SHELL", "sh")
+	}
+	// node-llama-cpp performs native binary probing in postinstall, which
+	// crashes on some Windows machines. Skip that install-time step and let
+	// users download/build local runtime support later if they need it.
+	if runtime.GOOS == "windows" {
+		env = setEnv(env, "NODE_LLAMA_CPP_SKIP_DOWNLOAD", "true")
+	}
+	env = forceGitHubMirrorForNpm(cfg, env)
 
 	if cfg.NpmRegistry != "" {
 		env = setEnv(env, "NPM_CONFIG_REGISTRY", cfg.NpmRegistry)
@@ -464,6 +858,87 @@ func buildNpmEnv(cfg InstallerConfig) []string {
 	}
 
 	return env
+}
+
+func forceGitHubMirrorForNpm(cfg InstallerConfig, env []string) []string {
+	emptyConfigPath := ensureEmptyGitConfigPath()
+	if emptyConfigPath != "" {
+		env = setEnv(env, "GIT_CONFIG_GLOBAL", emptyConfigPath)
+	}
+	env = setEnv(env, "GIT_CONFIG_NOSYSTEM", "1")
+
+	replacement := "https://github.com/"
+	if cfg.UseCnMirrors {
+		replacement = gitHubCloneMirrorPrefix()
+	}
+
+	rewritePairs := []struct {
+		key   string
+		value string
+	}{
+		{key: fmt.Sprintf("url.%s.insteadOf", replacement), value: "ssh://git@github.com/"},
+		{key: fmt.Sprintf("url.%s.insteadOf", replacement), value: "git@github.com:"},
+		{key: fmt.Sprintf("url.%s.insteadOf", replacement), value: "git+ssh://git@github.com/"},
+		{key: fmt.Sprintf("url.%s.insteadOf", replacement), value: "git://github.com/"},
+	}
+	if cfg.UseCnMirrors {
+		rewritePairs = append(rewritePairs, struct {
+			key   string
+			value string
+		}{key: fmt.Sprintf("url.%s.insteadOf", replacement), value: "https://github.com/"})
+	}
+
+	env = setEnv(env, "GIT_CONFIG_COUNT", strconv.Itoa(len(rewritePairs)))
+	for index, pair := range rewritePairs {
+		env = setEnv(env, fmt.Sprintf("GIT_CONFIG_KEY_%d", index), pair.key)
+		env = setEnv(env, fmt.Sprintf("GIT_CONFIG_VALUE_%d", index), pair.value)
+	}
+
+	return env
+}
+
+func ensureEmptyGitConfigPath() string {
+	configPath := filepath.Join(os.TempDir(), "openclaw-empty.gitconfig")
+	if _, err := os.Stat(configPath); err == nil {
+		return configPath
+	}
+	if err := os.WriteFile(configPath, []byte(""), 0o644); err != nil {
+		return ""
+	}
+	return configPath
+}
+
+func rewriteGitHubURLToMirror(raw string) string {
+	replacements := []struct {
+		source string
+		target string
+	}{
+		{source: "https://github.com/", target: gitHubCloneMirrorPrefix()},
+		{source: "ssh://git@github.com/", target: gitHubCloneMirrorPrefix()},
+		{source: "git@github.com:", target: gitHubCloneMirrorPrefix()},
+		{source: "git+ssh://git@github.com/", target: gitHubCloneMirrorPrefix()},
+	}
+
+	for _, replacement := range replacements {
+		if strings.HasPrefix(raw, replacement.source) {
+			return replacement.target + strings.TrimPrefix(raw, replacement.source)
+		}
+	}
+
+	return raw
+}
+
+func gitHubCloneMirrorPrefix() string {
+	return "https://gitclone.com/github.com/"
+}
+
+func containsString(items []string, target string) bool {
+	for _, item := range items {
+		if item == target {
+			return true
+		}
+	}
+	return false
 }
 
 func removeInstalledOpenClawCLI(openclawPath string, emit func(string, string, string)) error {
@@ -712,9 +1187,17 @@ func execOutput(name string, args ...string) (string, error) {
 // streamCommand runs a command, streaming output line-by-line to the emit callback.
 // Returns nil on exit code 0, error otherwise.
 func streamCommand(name string, args []string, env []string, emit func(string, string, string), step string) error {
-	path, err := exec.LookPath(name)
-	if err != nil {
-		return fmt.Errorf("command not found: %s", name)
+	path := name
+	if strings.ContainsAny(name, `\/`) {
+		if _, err := os.Stat(name); err != nil {
+			return fmt.Errorf("command not found: %s", name)
+		}
+	} else {
+		var err error
+		path, err = exec.LookPath(name)
+		if err != nil {
+			return fmt.Errorf("command not found: %s", name)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -739,6 +1222,7 @@ func streamCommand(name string, args []string, env []string, emit func(string, s
 	}
 
 	var wg sync.WaitGroup
+	var outputTail commandOutputTail
 	wg.Add(2)
 
 	// Use decodeOutputBytes (defined in executor.go) to handle GBK / GB18030
@@ -749,6 +1233,7 @@ func streamCommand(name string, args []string, env []string, emit func(string, s
 		for scanner.Scan() {
 			line := sanitizeOutput(decodeOutputBytes(scanner.Bytes()))
 			if line != "" {
+				outputTail.Add(line)
 				emit(step, "running", line)
 			}
 		}
@@ -760,6 +1245,7 @@ func streamCommand(name string, args []string, env []string, emit func(string, s
 		for scanner.Scan() {
 			line := sanitizeOutput(decodeOutputBytes(scanner.Bytes()))
 			if line != "" {
+				outputTail.Add(line)
 				emit(step, "running", line)
 			}
 		}
@@ -768,10 +1254,168 @@ func streamCommand(name string, args []string, env []string, emit func(string, s
 	wg.Wait()
 
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("%s exited with error: %w", name, err)
+		return newCommandRunError(name, err, outputTail.Lines())
 	}
 
 	return nil
+}
+
+type commandOutputTail struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (t *commandOutputTail) Add(line string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	t.lines = append(t.lines, line)
+	const maxLines = 12
+	if len(t.lines) > maxLines {
+		t.lines = append([]string(nil), t.lines[len(t.lines)-maxLines:]...)
+	}
+}
+
+func (t *commandOutputTail) Lines() []string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]string(nil), t.lines...)
+}
+
+type commandRunError struct {
+	name      string
+	exitCode  string
+	diagnosis string
+	lastLines []string
+	err       error
+}
+
+func newCommandRunError(name string, err error, lastLines []string) error {
+	exitCode, diagnosis := describeProcessExit(err)
+	return &commandRunError{
+		name:      name,
+		exitCode:  exitCode,
+		diagnosis: diagnosis,
+		lastLines: lastLines,
+		err:       err,
+	}
+}
+
+func (e *commandRunError) Error() string {
+	message := fmt.Sprintf("%s exited with error", e.name)
+	if e.exitCode != "" {
+		message += fmt.Sprintf(" (%s)", e.exitCode)
+	}
+	if e.diagnosis != "" {
+		message += ": " + e.diagnosis
+	} else if e.err != nil {
+		message += fmt.Sprintf(": %v", e.err)
+	}
+	if len(e.lastLines) > 0 {
+		message += "\nLast output:\n" + strings.Join(e.lastLines, "\n")
+	}
+	return message
+}
+
+func (e *commandRunError) Unwrap() error {
+	return e.err
+}
+
+func describeProcessExit(err error) (string, string) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return "", ""
+	}
+
+	code := exitErr.ExitCode()
+	if code < 0 {
+		return fmt.Sprintf("exit code %d", code), ""
+	}
+
+	if runtime.GOOS != "windows" {
+		return fmt.Sprintf("exit code %d", code), ""
+	}
+
+	unsignedCode := uint32(code)
+	signedCode := int32(unsignedCode)
+	exitCode := fmt.Sprintf("exit code %d (0x%08x)", signedCode, unsignedCode)
+
+	switch signedCode {
+	case -4058:
+		return exitCode, "ENOENT: a required file or command was not found. On Windows this usually means npm tried to run a missing executable such as cmd.exe or git."
+	case -1073741819:
+		return exitCode, "native process crashed with an access violation. This usually comes from a native dependency or driver/runtime incompatibility on Windows."
+	case -1073741510:
+		return exitCode, "the process was interrupted or forcibly terminated"
+	case -1073741502:
+		return exitCode, "a required DLL failed to initialize"
+	default:
+		return exitCode, ""
+	}
+}
+
+func parseSemverParts(raw string) (semverParts, bool) {
+	matches := nodeVersionRe.FindStringSubmatch(strings.TrimSpace(raw))
+	if len(matches) != 4 {
+		return semverParts{}, false
+	}
+
+	major, err := strconv.Atoi(matches[1])
+	if err != nil {
+		return semverParts{}, false
+	}
+	minor, err := strconv.Atoi(matches[2])
+	if err != nil {
+		return semverParts{}, false
+	}
+	patch, err := strconv.Atoi(matches[3])
+	if err != nil {
+		return semverParts{}, false
+	}
+
+	return semverParts{Major: major, Minor: minor, Patch: patch}, true
+}
+
+func compareSemverParts(left, right semverParts) int {
+	switch {
+	case left.Major != right.Major:
+		return left.Major - right.Major
+	case left.Minor != right.Minor:
+		return left.Minor - right.Minor
+	default:
+		return left.Patch - right.Patch
+	}
+}
+
+func formatSemverParts(version semverParts) string {
+	return fmt.Sprintf("%d.%d.%d", version.Major, version.Minor, version.Patch)
+}
+
+func resolveWindowsCmdPath() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+
+	candidates := []string{
+		os.Getenv("ComSpec"),
+		filepath.Join(os.Getenv("SystemRoot"), "System32", "cmd.exe"),
+		filepath.Join(os.Getenv("WINDIR"), "System32", "cmd.exe"),
+	}
+
+	for _, candidate := range candidates {
+		if candidate == "" {
+			continue
+		}
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	if path, err := exec.LookPath("cmd.exe"); err == nil {
+		return path
+	}
+
+	return "cmd.exe"
 }
 
 // setEnv adds or replaces an environment variable in a []string slice.

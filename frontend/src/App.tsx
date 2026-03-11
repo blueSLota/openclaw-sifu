@@ -118,7 +118,7 @@ export default function App() {
         noOnboard: true,
         noGitUpdate: false,
         dryRun: false,
-        useCnMirrors: false,
+        useCnMirrors: true,
         npmRegistry: '',
         installBaseUrl: '',
         repoUrl: '',
@@ -537,7 +537,7 @@ export default function App() {
                 {(error || installerSteps.some(s => s.status === 'error')) && (
                   <div className="w-full bg-rose-50 border border-rose-200 rounded-2xl p-4 mb-8 text-left animate-fade-in-up animate-delay-200">
                     <div className="text-xs font-bold text-rose-400 uppercase tracking-wider mb-2">错误详情</div>
-                    <div className="text-sm text-rose-700 font-mono leading-relaxed break-all">
+                    <div className="text-sm text-rose-700 font-mono leading-relaxed break-all whitespace-pre-wrap">
                       {error || installerSteps.filter(s => s.status === 'error').map(s => s.message).join('\n')}
                     </div>
                   </div>
