@@ -9,7 +9,7 @@
 <a name="english"></a>
 ## English
 
-OpenClaw-Sifu is the standalone graphical installer and uninstaller for [OpenClaw](https://github.com/simonfqy/openclaw). Built with Wails, it provides a seamless, local installation experience by automating prerequisite checks, dependency acquisition, and environment initialization.
+OpenClaw-Sifu is the standalone graphical installer and uninstaller for [OpenClaw](https://github.com/simonfqy/openclaw). Built with Wails, it provides a seamless, local installation experience by automating prerequisite checks, dependency acquisition, and environment initialization. For the release version, please click here to [download](https://github.com/blueSLota/openclaw-sifu/releases).
 
 ### Features
 - **One-Click Setup:** Fully automated GUI for installing and removing OpenClaw.
@@ -41,7 +41,7 @@ wails build
 <a name="中文"></a>
 ## 中文
 
-OpenClaw-Sifu 是 [OpenClaw](https://github.com/simonfqy/openclaw) 的独立图形化安装与卸载工具。基于 Wails 构建，它通过自动化环境检查、依赖获取和环境初始化，提供无缝的本地安装体验。
+OpenClaw-Sifu 是 [OpenClaw](https://github.com/simonfqy/openclaw) 的独立图形化安装与卸载工具。基于 Wails 构建，它通过自动化环境检查、依赖获取和环境初始化，提供无缝的本地安装体验。发布版请点击这里进行[下载](https://github.com/blueSLota/openclaw-sifu/releases)。如果下载速度缓慢，也可以前往[官网](https://openclaw-sifu.com/)通过国内CDN下载
 
 ### 核心特性
 - **一键安装/卸载：** 全自动化的图形界面，一键完成 OpenClaw 的安装与清理。
